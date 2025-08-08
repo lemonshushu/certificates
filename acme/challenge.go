@@ -19,13 +19,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/google/go-tpm/legacy/tpm2"
@@ -112,11 +116,11 @@ func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, 
 	}
 	switch ch.Type {
 	case HTTP01:
-		return http01Validate(ctx, ch, db, jwk)
+		return http01ValidateMulti(ctx, ch, db, jwk)
 	case DNS01:
 		return dns01Validate(ctx, ch, db, jwk)
 	case TLSALPN01:
-		return tlsalpn01Validate(ctx, ch, db, jwk)
+		return tlsalpn01ValidateMulti(ctx, ch, db, jwk)
 	case DEVICEATTEST01:
 		return deviceAttest01Validate(ctx, ch, db, jwk, payload)
 	case WIREOIDC01:
@@ -134,6 +138,125 @@ func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, 
 	default:
 		return NewErrorISE("unexpected challenge type %q", ch.Type)
 	}
+}
+
+func http01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
+	// ---------- 1. build URL to fetch token from applicant -------------------
+	challengeURL := &url.URL{
+		Scheme: "http",
+		Host:   http01ChallengeHost(ch.Value),
+		Path:   fmt.Sprintf("/.well-known/acme-challenge/%s", ch.Token),
+	}
+	if InsecurePortHTTP01 != 0 {
+		challengeURL.Host += ":" + strconv.Itoa(InsecurePortHTTP01)
+	}
+
+	vc := MustClientFromContext(ctx)
+
+	// ---------- 2. single-perspective check (still required by RFC) ----------
+	resp, err := vc.Get(challengeURL.String())
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "GET %s", challengeURL))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return storeError(ctx, db, ch, false,
+			NewError(ErrorConnectionType, "GET %s returned %d", challengeURL, resp.StatusCode))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return WrapErrorISE(err, "reading %s", challengeURL)
+	}
+	keyAuth := strings.TrimSpace(string(body))
+
+	expected, err := KeyAuthorization(ch.Token, jwk)
+	if err != nil {
+		return err
+	}
+	if keyAuth != expected {
+		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+			"keyAuthorization mismatch; expected %s got %s", expected, keyAuth))
+	}
+
+	// ---------- 3. multi-perspective (open-mpic) check -----------------------
+	type dcvParams struct {
+		ValidationMethod string `json:"validation_method"` // "acme-http-01"
+		Token            string `json:"token"` // The token for the ACME http-01 challenge as described in RFC 8555 Section 8.3.
+		KeyAuthorization string `json:"key_authorization"` // The key authorization to be sent in the HTTP GET body as described in RFC 8555 Section 8.1. The value will be checked by stripping trailing whitespace from the response and then performing an equality check on the two strings.
+	}
+	type mpicReq struct {
+		CheckType          string    `json:"check_type"` // "dcv"
+		DomainOrIPTarget   string    `json:"domain_or_ip_target"`
+		TraceIdentifier    string    `json:"trace_identifier"` // A optional unique identifier for the request. This identifier is used to track the request through the system and can be used to correlate the request with other systems.
+		DCVCheckParameters dcvParams `json:"dcv_check_parameters"`
+	}
+	reqBody, _ := json.Marshal(mpicReq{
+		CheckType:        "dcv",
+		DomainOrIPTarget: ch.Value,
+		TraceIdentifier:  uuid.NewString(),
+		DCVCheckParameters: dcvParams{
+			ValidationMethod: "acme-http-01",
+			Token:            ch.Token,
+			KeyAuthorization: expected,
+		},
+	})
+
+	// ── 3. multi-perspective validation via open-mpic ──────────────────────────
+	raw, _ := json.Marshal(reqBody)
+
+	// use a plain net/http client; 10 s hard timeout
+	mpicClient := &http.Client{Timeout: 10 * time.Second}
+
+	// Print the request body for debugging purposes.
+	var mpicBody bytes.Buffer
+	json.Indent(&mpicBody, raw, "", "  ")
+	fmt.Fprintf(os.Stdout, "→ MPIC request\n%s\n", mpicBody.String())
+
+	mpicResp, err := mpicClient.Post(
+		"http://coordinator/mpic",
+		"application/json",
+		bytes.NewReader(raw),
+	)
+
+	// Print the response body for debugging purposes.
+	respDump, _ := io.ReadAll(mpicResp.Body)
+	fmt.Fprintf(os.Stdout, "← MPIC %d\n%s\n", mpicResp.StatusCode, respDump)
+
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "open-mpic unreachable"))
+	}
+	defer mpicResp.Body.Close()
+
+	if mpicResp.StatusCode >= 400 {
+		return storeError(ctx, db, ch, false,
+			NewError(ErrorConnectionType, "open-mpic returned %d", mpicResp.StatusCode))
+	}
+
+	var verdict struct {
+		IsValid bool `json:"is_valid"`
+	}
+	if err := json.NewDecoder(mpicResp.Body).Decode(&verdict); err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "decoding open-mpic response"))
+	}
+	if !verdict.IsValid {
+		return storeError(ctx, db, ch, true,
+			NewError(ErrorRejectedIdentifierType, "open-mpic quorum rejected DCV"))
+	}
+
+	// ---------- 4. mark challenge valid & persist ---------------------------
+	ch.Status = StatusValid
+	ch.Error = nil
+	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+
+	if err = db.UpdateChallenge(ctx, ch); err != nil {
+		return WrapErrorISE(err, "updating challenge")
+	}
+	return nil
 }
 
 func http01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
@@ -353,6 +476,162 @@ func tlsalpn01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSON
 
 	return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
 		"incorrect certificate for tls-alpn-01 challenge: missing acmeValidationV1 extension"))
+}
+
+func tlsalpn01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
+	cfg := &tls.Config{
+		NextProtos:       []string{"acme-tls/1"},
+		MinVersion:       tls.VersionTLS12,
+		ServerName:       serverName(ch),
+		InsecureSkipVerify: true, // we expect self-signed
+	}
+	hostPort := tlsAlpn01ChallengeHost(ch.Value)
+	if port := InsecurePortTLSALPN01; port == 0 {
+		hostPort = net.JoinHostPort(hostPort, "443")
+	} else {
+		hostPort = net.JoinHostPort(hostPort, strconv.Itoa(port))
+	}
+
+	vc := MustClientFromContext(ctx)
+	conn, err := vc.TLSDial("tcp", hostPort, cfg)
+	if err != nil {
+		if tlsAlert(err) == 120 {
+			return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+				"cannot negotiate ALPN acme-tls/1 for tls-alpn-01"))
+		}
+		return storeError(ctx, db, ch, false, WrapError(ErrorConnectionType, err,
+			"TLS dial %s", ch.Value))
+	}
+	defer conn.Close()
+
+	cs := conn.ConnectionState()
+	if len(cs.PeerCertificates) == 0 {
+		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+			"tls-alpn-01: no peer certificate"))
+	}
+	if cs.NegotiatedProtocol != "acme-tls/1" {
+		return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+			"tls-alpn-01: ALPN not negotiated"))
+	}
+	leafCert := cs.PeerCertificates[0]
+
+	// host match (DNS or IP) --------------------------------------------------
+	if len(leafCert.DNSNames) == 0 {
+		if len(leafCert.IPAddresses) != 1 || !leafCert.IPAddresses[0].Equal(net.ParseIP(ch.Value)) {
+			return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+				"tls-alpn-01: leaf cert must contain single name %v", ch.Value))
+		}
+	} else {
+		if len(leafCert.DNSNames) != 1 || !strings.EqualFold(leafCert.DNSNames[0], ch.Value) {
+			return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+				"tls-alpn-01: leaf cert must contain single name %v", ch.Value))
+		}
+	}
+
+	// extension check ---------------------------------------------------------
+	idPeAcmeIdentifier := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 31}
+	idPeAcmeIdentifierV1Obsolete := asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 1, 30, 1}
+	foundObsolete := false
+
+	keyAuth, err := KeyAuthorization(ch.Token, jwk)
+	if err != nil { return err }
+	hashed := sha256.Sum256([]byte(keyAuth))
+
+	for _, ext := range leafCert.Extensions {
+		switch {
+		case idPeAcmeIdentifier.Equal(ext.Id):
+			if !ext.Critical {
+				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+					"tls-alpn-01: acmeValidationV1 extension not critical"))
+			}
+			var v []byte
+			rest, err := asn1.Unmarshal(ext.Value, &v)
+			if err != nil || len(rest) > 0 || len(v) != len(hashed) {
+				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+					"tls-alpn-01: malformed acmeValidationV1"))
+			}
+			if subtle.ConstantTimeCompare(hashed[:], v) != 1 {
+				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+					"tls-alpn-01: expected %s got %s",
+					hex.EncodeToString(hashed[:]), hex.EncodeToString(v)))
+			}
+
+			// ---------- MPIC quorum check ----------------------------------
+			type dcvParams struct {
+				ValidationMethod string `json:"validation_method"`
+				Token            string `json:"token"`
+				KeyAuthorization string `json:"key_authorization"`
+			}
+			type mpicReq struct {
+				CheckType          string    `json:"check_type"`
+				DomainOrIPTarget   string    `json:"domain_or_ip_target"`
+				TraceIdentifier    string    `json:"trace_identifier"`
+				DCVCheckParameters dcvParams `json:"dcv_check_parameters"`
+			}
+			payload, _ := json.Marshal(mpicReq{
+				CheckType:        "dcv",
+				DomainOrIPTarget: ch.Value,
+				TraceIdentifier:  uuid.NewString(),
+				DCVCheckParameters: dcvParams{
+					ValidationMethod: "acme-tls-alpn-01",
+					Token:            ch.Token,
+					KeyAuthorization: keyAuth,
+				},
+			})
+
+			var mpicBody bytes.Buffer
+			json.Indent(&mpicBody, payload, "", "  ")
+			log.Printf("→ MPIC request\n%s\n", mpicBody.String())
+
+			mpicCli := &http.Client{Timeout: 10 * time.Second}
+			mpicResp, err := mpicCli.Post("http://coordinator/mpic",
+				"application/json", bytes.NewReader(payload))
+
+			respDump, _ := io.ReadAll(mpicResp.Body)
+			log.Printf("← MPIC %d\n%s\n", mpicResp.StatusCode, respDump)
+
+			if err != nil {
+				return storeError(ctx, db, ch, false,
+					WrapError(ErrorConnectionType, err, "open-mpic unreachable"))
+			}
+			defer mpicResp.Body.Close()
+
+			if mpicResp.StatusCode >= 400 {
+				return storeError(ctx, db, ch, false,
+					NewError(ErrorConnectionType, "open-mpic returned %d", mpicResp.StatusCode))
+			}
+			var verdict struct{ IsValid bool `json:"is_valid"` }
+			if err := json.NewDecoder(mpicResp.Body).Decode(&verdict); err != nil {
+				return storeError(ctx, db, ch, false,
+					WrapError(ErrorConnectionType, err, "decoding open-mpic"))
+			}
+			if !verdict.IsValid {
+				return storeError(ctx, db, ch, true, NewError(ErrorRejectedIdentifierType,
+					"open-mpic quorum rejected DCV"))
+			}
+			// ---------- end MPIC check -------------------------------------
+
+			ch.Status      = StatusValid
+			ch.Error       = nil
+			ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+			if err = db.UpdateChallenge(ctx, ch); err != nil {
+				return WrapErrorISE(err, "tlsalpn01Validate - updating challenge")
+			}
+			return nil
+
+		case idPeAcmeIdentifierV1Obsolete.Equal(ext.Id):
+			foundObsolete = true
+		}
+	}
+
+	if foundObsolete {
+		return storeError(ctx, db, ch, true,
+			NewError(ErrorRejectedIdentifierType,
+				"tls-alpn-01: obsolete id-pe-acmeIdentifier extension"))
+	}
+	return storeError(ctx, db, ch, true,
+		NewError(ErrorRejectedIdentifierType,
+			"tls-alpn-01: missing acmeValidationV1 extension"))
 }
 
 func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
