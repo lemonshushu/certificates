@@ -211,7 +211,7 @@ func http01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JS
 		},
 	})
 
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://127.0.0.1:8000/mpic", bytes.NewReader(payload))
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://coordinator/mpic", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
 
 	mpicClient := &http.Client{Timeout: 10 * time.Second}
@@ -583,7 +583,7 @@ func tlsalpn01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose
 			log.Printf("→ MPIC request\n%s\n", mpicBody.String())
 
 			mpicCli := &http.Client{Timeout: 10 * time.Second}
-			mpicResp, err := mpicCli.Post("http://127.0.0.1:8000/mpic",
+			mpicResp, err := mpicCli.Post("http://coordinator/mpic",
 				"application/json", bytes.NewReader(payload))
 
 			respDump, _ := io.ReadAll(mpicResp.Body)
@@ -748,7 +748,7 @@ func dns01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSO
 			WrapError(ErrorConnectionType, err, "marshal open-mpic dcv request"))
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:8000/mpic", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://coordinator/mpic", bytes.NewReader(payload))
 	if err != nil {
 		return storeError(ctx, db, ch, false,
 			WrapError(ErrorConnectionType, err, "create open-mpic request"))
