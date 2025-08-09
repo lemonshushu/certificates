@@ -23,7 +23,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -118,7 +117,7 @@ func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, 
 	case HTTP01:
 		return http01ValidateMulti(ctx, ch, db, jwk)
 	case DNS01:
-		return dns01Validate(ctx, ch, db, jwk)
+		return dns01ValidateMulti(ctx, ch, db, jwk)
 	case TLSALPN01:
 		return tlsalpn01ValidateMulti(ctx, ch, db, jwk)
 	case DEVICEATTEST01:
@@ -141,6 +140,13 @@ func (ch *Challenge) Validate(ctx context.Context, db DB, jwk *jose.JSONWebKey, 
 }
 
 func http01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
+	if ch == nil {
+    	return errors.New("nil Challenge passed to http01ValidateMulti")
+	}
+	if jwk == nil {
+		return errors.New("nil JWK passed to http01ValidateMulti")
+	}
+	
 	// ---------- 1. build URL to fetch token from applicant -------------------
 	challengeURL := &url.URL{
 		Scheme: "http",
@@ -193,37 +199,23 @@ func http01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JS
 		TraceIdentifier    string    `json:"trace_identifier"` // A optional unique identifier for the request. This identifier is used to track the request through the system and can be used to correlate the request with other systems.
 		DCVCheckParameters dcvParams `json:"dcv_check_parameters"`
 	}
-	reqBody, _ := json.Marshal(mpicReq{
+
+	payload, _ := json.Marshal(mpicReq{
 		CheckType:        "dcv",
 		DomainOrIPTarget: ch.Value,
 		TraceIdentifier:  uuid.NewString(),
 		DCVCheckParameters: dcvParams{
 			ValidationMethod: "acme-http-01",
 			Token:            ch.Token,
-			KeyAuthorization: expected,
+			KeyAuthorization: expected, // raw token.thumbprint
 		},
 	})
 
-	// ── 3. multi-perspective validation via open-mpic ──────────────────────────
-	raw, _ := json.Marshal(reqBody)
+	req, _ := http.NewRequestWithContext(ctx, "POST", "http://127.0.0.1:8000/mpic", bytes.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
 
-	// use a plain net/http client; 10 s hard timeout
 	mpicClient := &http.Client{Timeout: 10 * time.Second}
-
-	// Print the request body for debugging purposes.
-	var mpicBody bytes.Buffer
-	json.Indent(&mpicBody, raw, "", "  ")
-	fmt.Fprintf(os.Stdout, "→ MPIC request\n%s\n", mpicBody.String())
-
-	mpicResp, err := mpicClient.Post(
-		"http://coordinator/mpic",
-		"application/json",
-		bytes.NewReader(raw),
-	)
-
-	// Print the response body for debugging purposes.
-	respDump, _ := io.ReadAll(mpicResp.Body)
-	fmt.Fprintf(os.Stdout, "← MPIC %d\n%s\n", mpicResp.StatusCode, respDump)
+	mpicResp, err := mpicClient.Do(req)
 
 	if err != nil {
 		return storeError(ctx, db, ch, false,
@@ -236,9 +228,16 @@ func http01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JS
 			NewError(ErrorConnectionType, "open-mpic returned %d", mpicResp.StatusCode))
 	}
 
+	// Status code must be 200
+	if mpicResp.StatusCode != 200 {
+		return storeError(ctx, db, ch, false,
+			NewError(ErrorConnectionType, "open-mpic returned %d, expected 200", mpicResp.StatusCode))
+	}
+
 	var verdict struct {
 		IsValid bool `json:"is_valid"`
 	}
+
 	if err := json.NewDecoder(mpicResp.Body).Decode(&verdict); err != nil {
 		return storeError(ctx, db, ch, false,
 			WrapError(ErrorConnectionType, err, "decoding open-mpic response"))
@@ -584,7 +583,7 @@ func tlsalpn01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose
 			log.Printf("→ MPIC request\n%s\n", mpicBody.String())
 
 			mpicCli := &http.Client{Timeout: 10 * time.Second}
-			mpicResp, err := mpicCli.Post("http://coordinator/mpic",
+			mpicResp, err := mpicCli.Post("http://127.0.0.1:8000/mpic",
 				"application/json", bytes.NewReader(payload))
 
 			respDump, _ := io.ReadAll(mpicResp.Body)
@@ -676,6 +675,131 @@ func dns01Validate(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebK
 	}
 	return nil
 }
+
+
+// dns01ValidateMulti validates DNS-01 using local TXT lookup + Open-MPIC quorum.
+// It rejects issuance if the coordinator is unreachable or returns a non-200.
+func dns01ValidateMulti(ctx context.Context, ch *Challenge, db DB, jwk *jose.JSONWebKey) error {
+	if ch == nil {
+		return errors.New("nil Challenge passed to dns01ValidateMulti")
+	}
+	if jwk == nil {
+		return errors.New("nil JWK passed to dns01ValidateMulti")
+	}
+
+	// ---------- 1) Normalize domain (wildcards) & compute expected TXT --------
+	domain := strings.TrimPrefix(ch.Value, "*.")
+	// ACME DNS-01 TXT value = base64url( SHA256( keyAuthorization(token,jwk) ) )
+	keyAuth, err := KeyAuthorization(ch.Token, jwk)
+	if err != nil {
+		return err
+	}
+	sum := sha256.Sum256([]byte(keyAuth))
+	expectedTXT := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	// ---------- 2) Single-perspective TXT check (required by RFC) -------------
+	vc := MustClientFromContext(ctx)
+	name := dns01ChallengeHost(domain) // _acme-challenge.<domain>
+	txtRecords, err := vc.LookupTxt(name)
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorDNSType, err, "TXT lookup %s", name))
+	}
+	found := false
+	for _, r := range txtRecords {
+		if r == expectedTXT {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return storeError(ctx, db, ch, true,
+			NewError(ErrorRejectedIdentifierType,
+				"dns-01 TXT mismatch for %s; expected %s, got %v", name, expectedTXT, txtRecords))
+	}
+
+	// ---------- 3) Multi-perspective (Open-MPIC) check ------------------------
+	type dcvParams struct {
+		ValidationMethod string `json:"validation_method"` // "acme-dns-01"
+		Token            string `json:"token"`             // ACME token
+		KeyAuthorizationHash string `json:"key_authorization_hash"`
+	}
+	type mpicReq struct {
+		CheckType          string    `json:"check_type"` // "dcv"
+		DomainOrIPTarget   string    `json:"domain_or_ip_target"`
+		TraceIdentifier    string    `json:"trace_identifier"`
+		DCVCheckParameters dcvParams `json:"dcv_check_parameters"`
+	}
+
+	keyAuthHash := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	payload, err := json.Marshal(mpicReq{
+		CheckType:        "dcv",
+		DomainOrIPTarget: ch.Value,           // preserve "*" if caller passed it; coordinator should normalize
+		TraceIdentifier:  uuid.NewString(),
+		DCVCheckParameters: dcvParams{
+			ValidationMethod: "acme-dns-01",
+			Token:            ch.Token,
+			KeyAuthorizationHash: keyAuthHash,
+		},
+	})
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "marshal open-mpic dcv request"))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://127.0.0.1:8000/mpic", bytes.NewReader(payload))
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "create open-mpic request"))
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	mpicClient := &http.Client{Timeout: 10 * time.Second}
+	mpicResp, err := mpicClient.Do(req)
+	if err != nil {
+		// hard fail: no fallback to single-perspective
+		return storeError(ctx, db, ch, false,
+			NewError(ErrorConnectionType, "open-mpic unreachable: %v", err))
+	}
+	defer mpicResp.Body.Close()
+
+	if mpicResp.StatusCode != http.StatusOK {
+		// read body for operator visibility
+		body, _ := io.ReadAll(mpicResp.Body)
+		return storeError(ctx, db, ch, false,
+			NewError(ErrorConnectionType, "open-mpic returned %d: %s", mpicResp.StatusCode, strings.TrimSpace(string(body))))
+	}
+
+	respBytes, err := io.ReadAll(mpicResp.Body)
+	if err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "read open-mpic response"))
+	}
+
+	var verdict struct {
+		IsValid bool `json:"is_valid"`
+	}
+	if err := json.Unmarshal(respBytes, &verdict); err != nil {
+		return storeError(ctx, db, ch, false,
+			WrapError(ErrorConnectionType, err, "decode open-mpic verdict; raw=%s", string(respBytes)))
+	}
+	if !verdict.IsValid {
+		return storeError(ctx, db, ch, true,
+			NewError(ErrorRejectedIdentifierType, "open-mpic quorum rejected dns-01"))
+	}
+
+	// ---------- 4) Persist success -------------------------------------------
+	ch.Status = StatusValid
+	ch.Error = nil
+	ch.ValidatedAt = clock.Now().Format(time.RFC3339)
+
+	if err = db.UpdateChallenge(ctx, ch); err != nil {
+		return WrapErrorISE(err, "updating challenge")
+	}
+	return nil
+}
+
 
 type wireOidcPayload struct {
 	// IDToken contains the OIDC identity token
